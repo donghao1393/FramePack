@@ -137,9 +137,9 @@ def apply_rotary_emb_transposed(x, freqs_cis):
     out = out.to(x)
     return out
 
-# Metal per-buffer cap ≈ 2^34 bytes; use half for safety
+# Metal per-buffer cap ≈ 2^34 bytes; use 80% for high-memory devices
 _METAL_MAX_BUF = 2**34
-_SAFE_BUF      = _METAL_MAX_BUF // 2
+_SAFE_BUF      = int(_METAL_MAX_BUF * 0.8)  # Increased from 50% to 80% for 128GB devices
 
 def compute_safe_q_chunk(q2, k2, bytes_per_elem_scratch=6):
     """
@@ -171,21 +171,24 @@ def safe_sdp_attention(q, k, v, *, is_causal=False, dropout_p=0.0, max_chunks=8)
     # Predict initial number of Q-chunks
     safe_chunk = compute_safe_q_chunk(q2, k2)     # max tokens per chunk
     initial_splits = math.ceil(T / safe_chunk)    # splits needed
-    # Build chunk counts list: initial, then *2 until <= max_chunks
-    chunk_counts = []
-    n = initial_splits
-    while n <= max_chunks:
-        chunk_counts.append(n)
-        n *= 2
-    # Ensure max_chunks is included
-    if chunk_counts[-1] != max_chunks:
-        chunk_counts.append(max_chunks)
+    # Build chunk counts list: start with 1 (no chunking) for high-memory devices
+    # then try initial_splits and double until <= max_chunks
+    chunk_counts = [1]  # Always try no chunking first on high-memory devices
+    if initial_splits > 1 and initial_splits != 1:  # If calculation suggests chunking is needed
+        n = initial_splits
+        while n <= max_chunks:
+            if n not in chunk_counts:  # Avoid duplicates if initial_splits is 1
+                chunk_counts.append(n)
+            n *= 2
+        # Ensure max_chunks is included
+        if chunk_counts[-1] != max_chunks:
+            chunk_counts.append(max_chunks)
 
     # Try chunking Q into 1, 2, 4, ..., up to max_chunks
     for n_chunks in chunk_counts:
         chunk_size = math.ceil(T / n_chunks)
         try:
-            print(f"Trying {n_chunks} chunks of size {chunk_size}")
+            print(f"Trying {n_chunks} chunks of size {chunk_size} (total tokens: {T}, safe_chunk: {safe_chunk})")
             for start in range(0, T, chunk_size):
                 end = min(start + chunk_size, T)
                 qc = q2[:, :, start:end, :]  # [B, H, chunk, D]
@@ -201,6 +204,7 @@ def safe_sdp_attention(q, k, v, *, is_causal=False, dropout_p=0.0, max_chunks=8)
             continue  # try smaller chunks
 
     # If all fused attempts OOM, fall back to naive matmul
+    print(f"All fused attempts failed, falling back to naive matmul with {max_chunks} chunks")
     out = torch.empty_like(q)
     k_t = k.transpose(-2, -1).contiguous()
     scale = 1.0 / math.sqrt(D)
@@ -212,7 +216,7 @@ def safe_sdp_attention(q, k, v, *, is_causal=False, dropout_p=0.0, max_chunks=8)
         oc     = torch.matmul(probs, v[:, start:end, :, :])
         out[:, start:end, :, :] = oc
     return out
- 
+
 def mps_attn_varlen_func(q, k, v):
     return safe_sdp_attention(
         q, k, v,
