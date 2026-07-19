@@ -311,7 +311,7 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
 
             # VAE decode: direct on ≥96 GB free (512 GB Studio-class machines),
             # chunked otherwise to keep MPS peak < 50 GB (128 GB M4 Max safe).
-            _use_direct_vae = get_cuda_free_memory_gb(gpu) >= 80
+            _use_direct_vae = get_cuda_free_memory_gb(gpu) >= 96
 
             if history_pixels is None:
                 if _use_direct_vae:
