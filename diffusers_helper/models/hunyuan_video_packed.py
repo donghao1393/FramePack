@@ -20,14 +20,20 @@ from diffusers_helper.utils import zero_module
 
 enabled_backends = []
 
-if torch.backends.cuda.flash_sdp_enabled():
-    enabled_backends.append("flash")
-if torch.backends.cuda.math_sdp_enabled():
-    enabled_backends.append("math")
-if torch.backends.cuda.mem_efficient_sdp_enabled():
-    enabled_backends.append("mem_efficient")
-if torch.backends.cuda.cudnn_sdp_enabled():
-    enabled_backends.append("cudnn")
+# guard: torch.backends.cuda may be absent or uninitialised on non-CUDA
+_cuda_backends_available = torch.cuda.is_available() and hasattr(torch.backends, 'cuda')
+if _cuda_backends_available:
+    try:
+        if torch.backends.cuda.flash_sdp_enabled():
+            enabled_backends.append("flash")
+        if torch.backends.cuda.math_sdp_enabled():
+            enabled_backends.append("math")
+        if torch.backends.cuda.mem_efficient_sdp_enabled():
+            enabled_backends.append("mem_efficient")
+        if torch.backends.cuda.cudnn_sdp_enabled():
+            enabled_backends.append("cudnn")
+    except Exception:
+        pass
 
 print("Currently enabled native sdp backends:", enabled_backends)
 
@@ -84,7 +90,7 @@ def get_cu_seqlens(text_mask, img_len):
     text_len = text_mask.sum(dim=1)
     max_len = text_mask.shape[1] + img_len
 
-    cu_seqlens = torch.zeros([2 * batch_size + 1], dtype=torch.int32, device="cuda")
+    cu_seqlens = torch.zeros([2 * batch_size + 1], dtype=torch.int32, device=text_mask.device)
 
     for i in range(batch_size):
         s = text_len[i] + img_len

@@ -2,7 +2,7 @@ from diffusers_helper.hf_login import login
 
 import os
 
-os.environ['HF_HOME'] = os.path.abspath(os.path.realpath(os.path.join(os.path.dirname(__file__), './hf_download')))
+# os.environ['HF_HOME'] = ...  (disabled — use global ~/.cache/huggingface)
 
 import gradio as gr
 import torch
@@ -97,6 +97,34 @@ stream = AsyncStream()
 
 outputs_folder = './outputs/'
 os.makedirs(outputs_folder, exist_ok=True)
+
+
+def _vae_decode_chunked(latents, vae, chunk_latents=4):
+    """Decode latent frames in overlapping chunks to cap MPS peak memory.
+
+    HunyuanVideo VAE with >3 latent frames can exceed 100 GB MPS allocation.
+    Splitting into overlapping chunks keeps each decode call under ~35 GB.
+    """
+    from diffusers_helper.utils import soft_append_bcthw
+    scaled = latents / vae.config.scaling_factor
+    total = scaled.shape[2]
+    history = None
+    pos = 0
+    while pos < total:
+        if history is None:
+            s, e = 0, min(chunk_latents, total)
+        else:
+            s, e = pos - 2, min(pos - 2 + chunk_latents, total)
+        chunk = scaled[:, :, s:e, :, :].to(device=vae.device, dtype=vae.dtype)
+        with torch.no_grad():
+            pixels = vae.decode(chunk).sample.cpu()
+        torch.mps.empty_cache()
+        if history is None:
+            history = pixels
+        else:
+            history = soft_append_bcthw(history, pixels[:, :, 1:], overlap=2)
+        pos = e
+    return history
 
 
 @torch.no_grad()
@@ -281,13 +309,23 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
 
             real_history_latents = history_latents[:, :, :total_generated_latent_frames, :, :]
 
+            # VAE decode: direct on ≥96 GB free (512 GB Studio-class machines),
+            # chunked otherwise to keep MPS peak < 50 GB (128 GB M4 Max safe).
+            _use_direct_vae = get_cuda_free_memory_gb(gpu) >= 96
+
             if history_pixels is None:
-                history_pixels = vae_decode(real_history_latents, vae).cpu()
+                if _use_direct_vae:
+                    history_pixels = vae_decode(real_history_latents, vae).cpu()
+                else:
+                    history_pixels = _vae_decode_chunked(real_history_latents, vae).cpu()
             else:
                 section_latent_frames = (latent_window_size * 2 + 1) if is_last_section else (latent_window_size * 2)
                 overlapped_frames = latent_window_size * 4 - 3
 
-                current_pixels = vae_decode(real_history_latents[:, :, :section_latent_frames], vae).cpu()
+                if _use_direct_vae:
+                    current_pixels = vae_decode(real_history_latents[:, :, :section_latent_frames], vae).cpu()
+                else:
+                    current_pixels = _vae_decode_chunked(real_history_latents[:, :, :section_latent_frames], vae).cpu()
                 history_pixels = soft_append_bcthw(current_pixels, history_pixels, overlapped_frames)
 
             if not high_vram:
