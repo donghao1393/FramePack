@@ -99,7 +99,7 @@ outputs_folder = './outputs/'
 os.makedirs(outputs_folder, exist_ok=True)
 
 
-def _vae_decode_chunked(latents, vae, chunk_latents=4):
+def _vae_decode_chunked(latents, vae, chunk_latents=6):
     """Decode latent frames in overlapping chunks to cap MPS peak memory.
 
     HunyuanVideo VAE with >3 latent frames can exceed 100 GB MPS allocation.
@@ -122,7 +122,7 @@ def _vae_decode_chunked(latents, vae, chunk_latents=4):
         if history is None:
             history = pixels
         else:
-            history = soft_append_bcthw(history, pixels[:, :, 1:], overlap=2)
+            history = soft_append_bcthw(history, pixels[:, :, 1:], overlap=1)
         pos = e
     return history
 
@@ -242,6 +242,9 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
             if not high_vram:
                 unload_complete_models()
                 move_model_to_device_with_memory_preservation(transformer, target_device=gpu, preserved_memory_gb=gpu_memory_preservation)
+            elif next(transformer.parameters()).device.type != gpu.type:
+                # Reload DiT after offload-for-VAE in the high-VRAM path
+                move_model_to_device_with_memory_preservation(transformer, target_device=gpu, preserved_memory_gb=0)
 
             if use_teacache:
                 transformer.initialize_teacache(enable_teacache=True, num_steps=steps)
@@ -309,9 +312,17 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
 
             real_history_latents = history_latents[:, :, :total_generated_latent_frames, :, :]
 
-            # VAE decode: direct on ≥96 GB free (512 GB Studio-class machines),
-            # chunked otherwise to keep MPS peak < 50 GB (128 GB M4 Max safe).
-            _use_direct_vae = get_cuda_free_memory_gb(gpu) >= 96
+            # VAE decode: direct if free RAM after offloading DiT ≥ 108 GB
+            # peak (eliminates chunk-boundary blending → zero ghosting on
+            # fast motion).  DiT offload costs ~2s/section, negligible vs
+            # 10 min sampling.  Falls back to chunked when memory is tight
+            # (≤96 GB Macs).
+            _can_direct_after_offload = get_cuda_free_memory_gb(gpu) >= 82
+            if _can_direct_after_offload and high_vram:
+                offload_model_from_device_for_memory_preservation(
+                    transformer, target_device=gpu, preserved_memory_gb=8)
+                torch.mps.empty_cache()
+            _use_direct_vae = get_cuda_free_memory_gb(gpu) >= 96 or _can_direct_after_offload
 
             if history_pixels is None:
                 if _use_direct_vae:
