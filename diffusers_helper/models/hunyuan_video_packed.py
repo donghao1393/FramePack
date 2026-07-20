@@ -118,19 +118,29 @@ MPS_SDPA_CHUNK = 3068
 
 
 def _mps_chunked_sdpa(q, k, v):
-    """Chunked SDPA for MPS — split Q, keep full K/V (mathematically exact)."""
+    """Chunked SDPA for MPS — fp32 compute to avoid bf16 softmax precision loss.
+
+    MPS bf16 SDPA loses ~2× precision vs fp32 on large sequences (14k+ tokens),
+    manifesting as edge smearing / stutter on fast limb motion.  Converting
+    Q/K/V to fp32 for the attention computation preserves softmax fidelity;
+    the output is cast back to the input dtype for downstream compatibility.
+    M4 Max fp32 GEMM throughput equals bf16 (no fast-path), so the overhead
+    is just the dtype conversion (~1 ms per attention call).
+    """
+    orig_dtype = q.dtype
+    q_fp32 = q.float()
     L = q.shape[1]
     if L <= MPS_SDPA_CHUNK:
         return torch.nn.functional.scaled_dot_product_attention(
-            q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
-        ).transpose(1, 2)
-    q_t, k_t, v_t = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
+            q_fp32.transpose(1, 2), k.float().transpose(1, 2), v.float().transpose(1, 2)
+        ).transpose(1, 2).to(orig_dtype)
+    q_t, k_t, v_t = q_fp32.transpose(1, 2), k.float().transpose(1, 2), v.float().transpose(1, 2)
     outs = []
     for start in range(0, L, MPS_SDPA_CHUNK):
         end = min(start + MPS_SDPA_CHUNK, L)
         outs.append(torch.nn.functional.scaled_dot_product_attention(
             q_t[:, :, start:end], k_t, v_t))
-    return torch.cat(outs, dim=2).transpose(1, 2)
+    return torch.cat(outs, dim=2).transpose(1, 2).to(orig_dtype)
 
 
 def attn_varlen_func(q, k, v, cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, max_seqlen_kv):
